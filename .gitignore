@@ -1,0 +1,23 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go build/test artifacts
+*.test
+*.out
+cover.out
+coverage.out
+cpu.pprof
+*.pprof
+
+# Editor/OS files
+.DS_Store
+.idea/
+.vscode/
+
+# Runtime data
+*.ndjson
+.env
