@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
 	_ "net/http/pprof"
@@ -19,10 +21,17 @@ import (
 )
 
 const (
+	modeIngest = "ingest"
+	modeReplay = "replay"
+
 	defaultFeedURL = "wss://ws.kraken.com/v2"
 	defaultPair    = "BTC/USD"
 	defaultOutFile = "kraken_book.ndjson"
+	defaultInFile  = "kraken_book.ndjson"
 	defaultPprof   = "localhost:6060"
+	defaultMode    = modeIngest
+	defaultSpeed   = 1.0
+
 	reconnectDelay = 2 * time.Second
 	readDeadline   = 30 * time.Second
 	metricsEvery   = 5 * time.Second
@@ -33,10 +42,18 @@ type bookEvent struct {
 	RawPayload    json.RawMessage `json:"raw_payload"`
 }
 
+type waitFunc func(context.Context, time.Duration) error
+
 func main() {
 	runtime.MemProfileRate = 1
 
-	cfg := readConfig()
+	cfg, err := readConfig()
+	if err != nil {
+		log.Fatalf("invalid config: %v", err)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	log.Printf("pprof listening on http://%s/debug/pprof/", cfg.pprofAddr)
 	go func() {
@@ -45,29 +62,52 @@ func main() {
 		}
 	}()
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	if err := runNaiveIngestLoop(ctx, cfg); err != nil && !errors.Is(err, context.Canceled) {
-		log.Fatalf("stream stopped: %v", err)
+	switch cfg.mode {
+	case modeIngest:
+		if err := runNaiveIngestLoop(ctx, cfg); err != nil && !errors.Is(err, context.Canceled) {
+			log.Fatalf("stream stopped: %v", err)
+		}
+	case modeReplay:
+		if err := runReplay(ctx, cfg, os.Stdout, waitForDuration); err != nil && !errors.Is(err, context.Canceled) {
+			log.Fatalf("replay stopped: %v", err)
+		}
+	default:
+		log.Fatalf("unsupported mode %q", cfg.mode)
 	}
 }
 
 type config struct {
+	mode      string
 	feedURL   string
 	pair      string
 	outFile   string
 	pprofAddr string
+	inFile    string
+	speed     float64
 }
 
-func readConfig() config {
+func readConfig() (config, error) {
 	var cfg config
+	flag.StringVar(&cfg.mode, "mode", defaultMode, "Run mode: ingest or replay")
 	flag.StringVar(&cfg.feedURL, "feed-url", envOrDefault("KRAKEN_FEED_URL", defaultFeedURL), "Kraken websocket URL")
 	flag.StringVar(&cfg.pair, "pair", envOrDefault("KRAKEN_PAIR", defaultPair), "Trading pair to subscribe to")
 	flag.StringVar(&cfg.outFile, "out-file", envOrDefault("OUT_FILE", defaultOutFile), "NDJSON output file")
 	flag.StringVar(&cfg.pprofAddr, "pprof-addr", envOrDefault("PPROF_ADDR", defaultPprof), "pprof HTTP bind address")
+	flag.StringVar(&cfg.inFile, "in-file", defaultInFile, "NDJSON input file for replay mode")
+	flag.Float64Var(&cfg.speed, "speed", defaultSpeed, "Replay speed multiplier (>0), only used in replay mode")
 	flag.Parse()
-	return cfg
+
+	switch cfg.mode {
+	case modeIngest, modeReplay:
+	default:
+		return config{}, fmt.Errorf("mode must be %q or %q, got %q", modeIngest, modeReplay, cfg.mode)
+	}
+
+	if cfg.speed <= 0 {
+		return config{}, fmt.Errorf("speed must be > 0, got %.4f", cfg.speed)
+	}
+
+	return cfg, nil
 }
 
 func runNaiveIngestLoop(ctx context.Context, cfg config) error {
@@ -77,7 +117,7 @@ func runNaiveIngestLoop(ctx context.Context, cfg config) error {
 		}
 
 		err := streamOnce(ctx, cfg)
-		if err == nil || errors.Is(err, context.Canceled) {
+		if err == nil {
 			return err
 		}
 
@@ -92,7 +132,6 @@ func runNaiveIngestLoop(ctx context.Context, cfg config) error {
 }
 
 func streamOnce(ctx context.Context, cfg config) error {
-
 	file, err := os.OpenFile(cfg.outFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return err
@@ -203,7 +242,102 @@ func streamOnce(ctx context.Context, cfg config) error {
 			msgCount = 0
 			byteCount = 0
 		}
+	}
+}
 
+func runReplay(ctx context.Context, cfg config, out io.Writer, wait waitFunc) error {
+	file, err := os.Open(cfg.inFile)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 1024), 128*1024*1024)
+
+	lineNo := 0
+	var prevTime time.Time
+
+	for scanner.Scan() {
+		lineNo++
+
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		var evt bookEvent
+		if err := json.Unmarshal(scanner.Bytes(), &evt); err != nil {
+			return fmt.Errorf("line %d: decode envelope: %w", lineNo, err)
+		}
+
+		if evt.IngestedAtUTC.IsZero() {
+			return fmt.Errorf("line %d: missing ingested_at_utc", lineNo)
+		}
+
+		if len(evt.RawPayload) == 0 {
+			return fmt.Errorf("line %d: missing raw_payload", lineNo)
+		}
+
+		if !prevTime.IsZero() {
+			delay, err := replayDelay(prevTime, evt.IngestedAtUTC, cfg.speed)
+			if err != nil {
+				return fmt.Errorf("line %d: %w", lineNo, err)
+			}
+			if err := wait(ctx, delay); err != nil {
+				return err
+			}
+		}
+
+		if _, err := out.Write(evt.RawPayload); err != nil {
+			return fmt.Errorf("line %d: write payload: %w", lineNo, err)
+		}
+		if _, err := out.Write([]byte{'\n'}); err != nil {
+			return fmt.Errorf("line %d: write newline: %w", lineNo, err)
+		}
+
+		prevTime = evt.IngestedAtUTC
+	}
+
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func replayDelay(prev, next time.Time, speed float64) (time.Duration, error) {
+	if speed <= 0 {
+		return 0, fmt.Errorf("speed must be > 0, got %.4f", speed)
+	}
+
+	delta := next.Sub(prev)
+	if delta < 0 {
+		return 0, fmt.Errorf("timestamps not monotonic: %s then %s", prev.Format(time.RFC3339Nano), next.Format(time.RFC3339Nano))
+	}
+	if delta == 0 {
+		return 0, nil
+	}
+
+	scaled := time.Duration(float64(delta) / speed)
+	if scaled < 0 {
+		return 0, nil
+	}
+	return scaled, nil
+}
+
+func waitForDuration(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
 
