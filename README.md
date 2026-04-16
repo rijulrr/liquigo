@@ -49,20 +49,14 @@ go run . \
 
 ### Replay Mode
 
-Replay emits one `raw_payload` JSON object per line to stdout, preserving the
-original spacing between `ingested_at_utc` timestamps.
+Replay emits one `raw_payload` JSON object per line to stdout at max throughput
+(no delay between events).
 
 `pprof` is also started in replay mode, so profiling endpoints remain available
-while testing different replay speeds.
+while profiling replay performance.
 
 ```bash
 go run . -mode replay -in-file kraken_book.ndjson
-```
-
-Run faster than real-time:
-
-```bash
-go run . -mode replay -in-file kraken_book.ndjson -speed 5
 ```
 
 ### Environment Variables
@@ -76,7 +70,7 @@ go run . -mode replay -in-file kraken_book.ndjson -speed 5
 
 - `-mode` (`ingest` or `replay`, default `ingest`)
 - `-in-file` (replay input file, default `kraken_book.ndjson`)
-- `-speed` (replay speed multiplier, default `1`, must be `> 0`)
+- `-speed` (accepted for compatibility but ignored in max-throughput replay mode)
 
 ## Metrics Logs
 
