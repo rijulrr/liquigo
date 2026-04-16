@@ -2,6 +2,8 @@
 
 Lightweight Kraken websocket ingestor and replay harness for Kraken book JSON streams.
 
+Just messing around with what writing performant streaming systems in Go look like. Gonna be a little messy
+
 ## What It Does
 
 - Connects to `wss://ws.kraken.com/v2`
