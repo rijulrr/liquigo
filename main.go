@@ -1,5 +1,16 @@
 package main
 
+/**
+Plan is to keep code scoped to specific branch based on what performance aspect we're trying to isolate
+Naming convention: experiment/<aspect> (e.g. experiment/ingest-buffering, experiment/replay-cadence)
+
+This experiment branch is focused on CPU-bound compute
+Experiment checklist:
+1. Memory management patterns (object pools, zero-copy buffers, etc.)
+2. Concurrency models (goroutines, channels, worker pools)
+3. Algorithmic optimizations (parsing strategies, data structures)
+
+*/
 import (
 	"bufio"
 	"bytes"
