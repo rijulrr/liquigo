@@ -12,6 +12,7 @@ cover.out
 coverage.out
 cpu.pprof
 *.pprof
+*.gocache
 
 # Editor/OS files
 .DS_Store

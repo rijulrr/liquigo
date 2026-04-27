@@ -15,6 +15,8 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -24,6 +26,7 @@ import (
 const (
 	modeIngest = "ingest"
 	modeReplay = "replay"
+	modeQuery  = "query"
 
 	defaultFeedURL = "wss://ws.kraken.com/v2"
 	defaultPair    = "BTC/USD"
@@ -54,6 +57,7 @@ type config struct {
 	pprofAddr string
 	inFile    string
 	speed     float64
+	query     query
 }
 
 type ingestStats struct {
@@ -108,6 +112,8 @@ func runMode(ctx context.Context, cfg config) error {
 		return runNaiveIngestLoop(ctx, cfg)
 	case modeReplay:
 		return runReplay(ctx, cfg)
+	case modeQuery:
+		return runQueryMode(ctx, cfg)
 	default:
 		return fmt.Errorf("unsupported mode %q", cfg.mode)
 	}
@@ -115,17 +121,28 @@ func runMode(ctx context.Context, cfg config) error {
 
 func readConfig() (config, error) {
 	var cfg config
-	flag.StringVar(&cfg.mode, "mode", defaultMode, "Run mode: ingest or replay")
+	flag.StringVar(&cfg.mode, "mode", defaultMode, "Run mode: ingest, replay, or query")
 	flag.StringVar(&cfg.feedURL, "feed-url", envOrDefault("KRAKEN_FEED_URL", defaultFeedURL), "Kraken websocket URL")
 	flag.StringVar(&cfg.pair, "pair", envOrDefault("KRAKEN_PAIR", defaultPair), "Trading pair to subscribe to")
 	flag.StringVar(&cfg.outFile, "out-file", envOrDefault("OUT_FILE", defaultOutFile), "NDJSON output file")
 	flag.StringVar(&cfg.pprofAddr, "pprof-addr", envOrDefault("PPROF_ADDR", defaultPprof), "pprof HTTP bind address")
-	flag.StringVar(&cfg.inFile, "in-file", defaultInFile, "NDJSON input file for replay mode")
+	flag.StringVar(&cfg.inFile, "in-file", defaultInFile, "NDJSON input file for replay or query mode")
 	flag.Float64Var(&cfg.speed, "speed", defaultSpeed, "Replay speed multiplier (ignored in max-throughput replay mode)")
+	flag.Func("range", "Query time range as start,end or start..end (RFC3339Nano or unix timestamp)", func(v string) error {
+		q, err := parseQueryRange(v)
+		if err != nil {
+			return err
+		}
+		cfg.query = q
+		return nil
+	})
 	flag.Parse()
 
 	if err := validateMode(cfg.mode); err != nil {
 		return config{}, err
+	}
+	if cfg.mode == modeQuery && cfg.query.Start.IsZero() && cfg.query.End.IsZero() && cfg.query.StartTs == 0 && cfg.query.EndTs == 0 {
+		return config{}, fmt.Errorf("query mode requires -range")
 	}
 
 	return cfg, nil
@@ -134,10 +151,10 @@ func readConfig() (config, error) {
 func validateMode(mode string) error {
 	// Decision: fail fast at config parse time so unsupported modes never start runtime side effects.
 	switch mode {
-	case modeIngest, modeReplay:
+	case modeIngest, modeReplay, modeQuery:
 		return nil
 	default:
-		return fmt.Errorf("mode must be %q or %q, got %q", modeIngest, modeReplay, mode)
+		return fmt.Errorf("mode must be %q, %q, or %q, got %q", modeIngest, modeReplay, modeQuery, mode)
 	}
 }
 
@@ -375,14 +392,53 @@ func runReplayToWriter(ctx context.Context, cfg config, out io.Writer) error {
 			return err
 		}
 
-		// if err := writeReplayPayload(out, lineNo, evt.RawPayload); err != nil {
-		// 	return err
-		// }
+		if err := writeReplayPayload(out, lineNo, evt.RawPayload); err != nil {
+			return err
+		}
 
 		cadence.observe(evt.IngestedAtUTC, lineNo)
 	}
 
 	log.Printf("replay completed lines=%d mode=max-throughput", lineNo)
+	return nil
+}
+
+func runQueryMode(ctx context.Context, cfg config) error {
+	return runQueryModeToWriter(ctx, cfg, os.Stdout)
+}
+
+func runQueryModeToWriter(ctx context.Context, cfg config, out io.Writer) error {
+	started := time.Now()
+
+	store, err := loadUpdateEventStore(cfg.inFile)
+	if err != nil {
+		return err
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	row, resultCount, err := RunQueryBook(store, cfg.query)
+	if err != nil {
+		return err
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	if resultCount == 0 {
+		if _, err := fmt.Fprintln(out, "best_bid=NA best_ask=NA"); err != nil {
+			return err
+		}
+		log.Printf("query latency=%s results=0", time.Since(started))
+		return nil
+	}
+
+	if _, err := fmt.Fprintf(out, "best_bid=%.1f best_ask=%.1f\n", float64(row.BestBid)/10, float64(row.BestAsk)/10); err != nil {
+		return err
+	}
+
+	log.Printf("query latency=%s results=%d", time.Since(started), resultCount)
 	return nil
 }
 
@@ -393,6 +449,34 @@ func loadReplayLines(path string) ([][]byte, error) {
 		return nil, err
 	}
 	return bytes.Split(data, []byte{'\n'}), nil
+}
+
+func loadUpdateEventStore(path string) (UpdateEventStore, error) {
+	lines, err := loadReplayLines(path)
+	if err != nil {
+		return UpdateEventStore{}, err
+	}
+
+	events := make([]UpdateEvent, 0, len(lines))
+	lineNo := 0
+	for _, line := range lines {
+		if len(line) == 0 {
+			continue
+		}
+		lineNo++
+
+		evt, err := decodeReplayEnvelope(lineNo, line)
+		if err != nil {
+			return UpdateEventStore{}, err
+		}
+
+		events = append(events, UpdateEvent{
+			Ts:         evt.IngestedAtUTC,
+			RawPayload: append(json.RawMessage(nil), evt.RawPayload...),
+		})
+	}
+
+	return UpdateEventStore{events: events}, nil
 }
 
 func decodeReplayEnvelope(lineNo int, line []byte) (bookEvent, error) {
@@ -476,4 +560,46 @@ func envOrDefault(key, fallback string) string {
 		return fallback
 	}
 	return v
+}
+
+func parseQueryRange(v string) (query, error) {
+	var parts []string
+	switch {
+	case strings.Contains(v, ".."):
+		parts = strings.SplitN(v, "..", 2)
+	case strings.Contains(v, ","):
+		parts = strings.SplitN(v, ",", 2)
+	default:
+		return query{}, fmt.Errorf("range must use start,end or start..end")
+	}
+	if len(parts) != 2 {
+		return query{}, fmt.Errorf("range must include start and end")
+	}
+
+	start, err := parseQueryTime(strings.TrimSpace(parts[0]))
+	if err != nil {
+		return query{}, fmt.Errorf("parse range start: %w", err)
+	}
+	end, err := parseQueryTime(strings.TrimSpace(parts[1]))
+	if err != nil {
+		return query{}, fmt.Errorf("parse range end: %w", err)
+	}
+
+	return query{Start: start, End: end}, nil
+}
+
+func parseQueryTime(v string) (time.Time, error) {
+	if ts, err := time.Parse(time.RFC3339Nano, v); err == nil {
+		return ts, nil
+	}
+
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("expected RFC3339Nano or unix timestamp: %w", err)
+	}
+
+	if len(v) <= 10 {
+		return time.Unix(n, 0).UTC(), nil
+	}
+	return time.Unix(0, n).UTC(), nil
 }
