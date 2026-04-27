@@ -425,6 +425,7 @@ func decodeReplayEnvelope(lineNo int, line []byte) (bookEvent, error) {
 
 func decodeReplayPayload(lineNo int, raw json.RawMessage) error {
 	// Decision: force an inner JSON decode during replay so profiling includes payload parsing cost.
+	// TODO: explore zero-copy parsing strategies to avoid redundant decoding and copying of payload data.
 	var payload map[string]any
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return fmt.Errorf("line %d: decode payload: %w", lineNo, err)
