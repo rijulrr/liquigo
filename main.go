@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/arl/statsviz"
 	"github.com/gorilla/websocket"
 )
 
@@ -83,6 +84,12 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	statsviz.RegisterDefault()
+
+	go func() {
+		log.Println(http.ListenAndServe("localhost:6061", nil))
+	}()
 
 	startPprofServer(cfg.pprofAddr)
 

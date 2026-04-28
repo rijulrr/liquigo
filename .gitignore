@@ -22,3 +22,6 @@ cpu.pprof
 # Runtime data
 *.ndjson
 .env
+
+# Spec files
+spec.md

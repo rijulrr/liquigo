@@ -44,35 +44,6 @@ type query struct {
 	EndTs   int64
 }
 
-func RunQuery(store UpdateEventStore, query query) ([]json.RawMessage, error) {
-	rows, err := buildRows(store.events)
-	if err != nil {
-		return nil, err
-	}
-
-	start, end, err := queryBounds(query)
-	if err != nil {
-		return nil, err
-	}
-	if end < start {
-		return []json.RawMessage{}, nil
-	}
-
-	startIdx := sort.Search(len(rows), func(i int) bool {
-		return rows[i].Ts >= start
-	})
-	endIdx := sort.Search(len(rows), func(i int) bool {
-		return rows[i].Ts > end
-	})
-
-	out := make([]json.RawMessage, 0, endIdx-startIdx)
-	for _, row := range rows[startIdx:endIdx] {
-		out = append(out, append(json.RawMessage(nil), row.RawPayload...))
-	}
-
-	return out, nil
-}
-
 func RunQueryBook(store UpdateEventStore, query query) (Row, int, error) {
 	rows, err := buildRows(store.events)
 	if err != nil {
